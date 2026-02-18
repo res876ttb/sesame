@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sesame"
+version = "0.1.0"
+description = "SSH wrapper that memorizes passwords — supports ssh, scp, sftp, rsync"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = []
+classifiers = [
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/raymondh/sesame"
+
+[project.scripts]
+ssm = "sesame.cli:ssm_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
