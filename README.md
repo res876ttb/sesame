@@ -15,7 +15,7 @@ SSH wrapper that memorizes passwords — supports ssh, scp, sftp, and rsync.
 **Quick (no pip needed):**
 
 ```bash
-git clone https://github.com/youruser/sesame.git ~/.sesame
+git clone https://github.com/res876ttb/sesame.git ~/.sesame
 ~/.sesame/install.sh
 ```
 
