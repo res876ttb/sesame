@@ -18,6 +18,7 @@ from sesame.cli import (
     _resolve_alias,
     _resolve_ssh_user,
     _save_aliases,
+    _ssh_has_keys,
     ssm_main,
 )
 from sesame.credentials import CredentialStore
@@ -197,6 +198,81 @@ class TestResolveSshUser(unittest.TestCase):
             self.assertEqual(_resolve_ssh_user("host"), "me")
 
 
+class TestSSHHasKeys(unittest.TestCase):
+    """Tests for _ssh_has_keys()."""
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_explicit_i_flag(self, mock_run):
+        """Should return True when -i points to an existing key file."""
+        with mock.patch("sesame.cli.Path.expanduser", return_value=Path("/tmp")):
+            with mock.patch("sesame.cli.Path.is_file", return_value=True):
+                self.assertTrue(_ssh_has_keys("user@host", ["-i", "/tmp/mykey"]))
+        mock_run.assert_not_called()
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_explicit_i_flag_merged(self, mock_run):
+        """Should handle -i/path/to/key (no space)."""
+        with mock.patch("sesame.cli.Path.expanduser", return_value=Path("/tmp")):
+            with mock.patch("sesame.cli.Path.is_file", return_value=True):
+                self.assertTrue(_ssh_has_keys("user@host", ["-i/tmp/mykey"]))
+        mock_run.assert_not_called()
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_ssh_agent_with_keys(self, mock_run):
+        """Should return True when ssh-agent has keys loaded."""
+        mock_run.return_value = mock.Mock(returncode=0)
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/agent.sock"}):
+            with mock.patch("sesame.cli.Path.is_file", return_value=False):
+                self.assertTrue(_ssh_has_keys("user@host", []))
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_ssh_agent_no_keys(self, mock_run):
+        """Should not short-circuit when ssh-agent has no keys (exit 1)."""
+        mock_run.side_effect = [
+            mock.Mock(returncode=1),  # ssh-add -l → no keys
+            mock.Mock(returncode=0, stdout="identityfile ~/.ssh/id_rsa\n"),
+        ]
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/agent.sock"}):
+            with mock.patch("sesame.cli.Path.is_file", return_value=False):
+                self.assertFalse(_ssh_has_keys("user@host", []))
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_identity_file_from_ssh_config(self, mock_run):
+        """Should return True when ssh -G reports an existing identity file."""
+        mock_run.return_value = mock.Mock(
+            returncode=0,
+            stdout="user admin\nhostname host\nidentityfile ~/.ssh/id_ed25519\n",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("sesame.cli.Path.is_file", return_value=True):
+                self.assertTrue(_ssh_has_keys("admin@host", []))
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_no_keys_anywhere(self, mock_run):
+        """Should return False when no keys are found."""
+        mock_run.return_value = mock.Mock(
+            returncode=0,
+            stdout="user admin\nhostname host\nidentityfile ~/.ssh/id_rsa\n",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("sesame.cli.Path.is_file", return_value=False):
+                self.assertFalse(_ssh_has_keys("admin@host", []))
+
+    @mock.patch("sesame.cli.subprocess.run")
+    def test_strips_user_from_host(self, mock_run):
+        """ssh -G should receive bare hostname, not user@host."""
+        mock_run.return_value = mock.Mock(returncode=0, stdout="")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("sesame.cli.Path.is_file", return_value=False):
+                _ssh_has_keys("admin@myserver", [])
+        ssh_g_call = [
+            c for c in mock_run.call_args_list
+            if c[0][0][0] == "ssh"
+        ]
+        self.assertTrue(len(ssh_g_call) > 0)
+        self.assertEqual(ssh_g_call[0][0][0], ["ssh", "-G", "myserver"])
+
+
 @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
 class TestExtractTargetHosts(unittest.TestCase):
     """Tests for _extract_target_hosts()."""
@@ -313,12 +389,13 @@ class _SfMainTestBase(unittest.TestCase):
         shutil.rmtree(self.tmp_dir)
 
 
+@mock.patch("sesame.cli._ssh_has_keys", return_value=False)
 class TestStrictHostKeyChecking(_SfMainTestBase):
     """Tests that sf injects StrictHostKeyChecking=accept-new."""
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="testpw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_ssh_injects_strict_host_key(self, mock_run, _gp):
+    def test_ssh_injects_strict_host_key(self, mock_run, _gp, _hk):
         """sf user@host should inject -o StrictHostKeyChecking=accept-new."""
         with mock.patch("sys.argv", ["sf", "user@host"]):
             with self.assertRaises(SystemExit):
@@ -330,7 +407,7 @@ class TestStrictHostKeyChecking(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="testpw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_ssh_respects_user_strict(self, mock_run, _gp):
+    def test_ssh_respects_user_strict(self, mock_run, _gp, _hk):
         """If user sets StrictHostKeyChecking, sf should not override."""
         with mock.patch(
             "sys.argv",
@@ -348,7 +425,7 @@ class TestStrictHostKeyChecking(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="testpw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_scp_injects_strict_host_key(self, mock_run, _gp):
+    def test_scp_injects_strict_host_key(self, mock_run, _gp, _hk):
         """sf cp should inject -o StrictHostKeyChecking=accept-new."""
         with mock.patch(
             "sys.argv", ["sf", "cp", "local.txt", "user@host:/tmp/"]
@@ -362,7 +439,7 @@ class TestStrictHostKeyChecking(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="testpw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_rsync_injects_strict_via_e(self, mock_run, _gp):
+    def test_rsync_injects_strict_via_e(self, mock_run, _gp, _hk):
         """sf sync should inject StrictHostKeyChecking via -e ssh option."""
         with mock.patch(
             "sys.argv",
@@ -377,13 +454,14 @@ class TestStrictHostKeyChecking(_SfMainTestBase):
         self.assertIn("StrictHostKeyChecking=accept-new", cmd[idx + 1])
 
 
+@mock.patch("sesame.cli._ssh_has_keys", return_value=False)
 @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
 class TestPrePrompting(_SfMainTestBase):
     """Tests for pre-prompting missing credentials in the parent process."""
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="prompted_pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_prompts_for_missing_credential(self, mock_run, mock_gp, _res):
+    def test_prompts_for_missing_credential(self, mock_run, mock_gp, _res, _hk):
         """sf host (no stored pw) should prompt before launching SSH."""
         with mock.patch("sys.argv", ["sf", "192.168.1.92"]):
             with self.assertRaises(SystemExit):
@@ -394,7 +472,7 @@ class TestPrePrompting(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="prompted_pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_saves_prompted_credential_on_success(self, mock_run, mock_gp, _res):
+    def test_saves_prompted_credential_on_success(self, mock_run, mock_gp, _res, _hk):
         """Prompted password should be saved to store after exit_code==0."""
         with mock.patch("sys.argv", ["sf", "192.168.1.92"]):
             with self.assertRaises(SystemExit):
@@ -404,7 +482,7 @@ class TestPrePrompting(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="wrongpw")
     @mock.patch("sesame.cli.run_command", return_value=255)
-    def test_does_not_save_on_failure(self, mock_run, mock_gp, _res):
+    def test_does_not_save_on_failure(self, mock_run, mock_gp, _res, _hk):
         """Prompted password should NOT be saved if SSH fails."""
         with mock.patch("sys.argv", ["sf", "192.168.1.92"]):
             with self.assertRaises(SystemExit):
@@ -413,7 +491,7 @@ class TestPrePrompting(_SfMainTestBase):
         self.assertIsNone(store.lookup_by_key("me@192.168.1.92"))
 
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_no_prompt_when_credential_stored(self, mock_run, _res):
+    def test_no_prompt_when_credential_stored(self, mock_run, _res, _hk):
         """If a credential already exists, no prompt should appear."""
         store = CredentialStore()
         store.save("admin", "host", "saved_pw")
@@ -424,7 +502,7 @@ class TestPrePrompting(_SfMainTestBase):
         mock_gp.assert_not_called()
 
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_no_prompt_when_password_on_cmdline(self, mock_run, _res):
+    def test_no_prompt_when_password_on_cmdline(self, mock_run, _res, _hk):
         """sf user:password@host should not trigger a prompt."""
         with mock.patch("sesame.cli.getpass.getpass") as mock_gp:
             with mock.patch("sys.argv", ["sf", "admin:secret@host"]):
@@ -434,13 +512,24 @@ class TestPrePrompting(_SfMainTestBase):
 
     @mock.patch("sesame.cli.getpass.getpass", return_value="")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_empty_prompt_skips_credential(self, mock_run, mock_gp, _res):
+    def test_empty_prompt_skips_credential(self, mock_run, mock_gp, _res, _hk):
         """If user enters empty password at prompt, don't save or pass it."""
         with mock.patch("sys.argv", ["sf", "192.168.1.92"]):
             with self.assertRaises(SystemExit):
                 ssm_main()
         creds = mock_run.call_args[1].get("credentials", {})
         self.assertNotIn("me@192.168.1.92", creds)
+
+    @mock.patch("sesame.cli.getpass.getpass")
+    @mock.patch("sesame.cli.run_command", return_value=0)
+    def test_no_prompt_when_ssh_keys_available(self, mock_run, mock_gp, _res, mock_hk):
+        """If SSH keys are available, pre-prompt should be skipped."""
+        mock_hk.return_value = True
+        with mock.patch("sys.argv", ["sf", "192.168.1.92"]):
+            with self.assertRaises(SystemExit):
+                ssm_main()
+        mock_gp.assert_not_called()
+        mock_hk.assert_called()
 
 
 class TestAliasStorage(unittest.TestCase):
@@ -661,10 +750,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.patcher_cli_dir.stop()
         super().tearDown()
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_name_flag_saves_alias(self, mock_run, _gp, _res):
+    def test_name_flag_saves_alias(self, mock_run, _gp, _res, _hk):
         """sf host --name myalias should save an alias after connecting."""
         with mock.patch("sys.argv", ["sf", "admin@1.2.3.4", "--name", "myalias"]):
             with self.assertRaises(SystemExit):
@@ -673,10 +763,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.assertIn("myalias", aliases)
         self.assertEqual(aliases["myalias"]["target"], "admin@1.2.3.4")
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_name_flag_with_options(self, mock_run, _gp, _res):
+    def test_name_flag_with_options(self, mock_run, _gp, _res, _hk):
         """sf -p 2222 host --name myalias should store the -p option."""
         with mock.patch("sys.argv", ["sf", "-p", "2222", "admin@host", "--name", "srv"]):
             with self.assertRaises(SystemExit):
@@ -686,10 +777,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.assertIn("-p", aliases["srv"]["args"])
         self.assertIn("2222", aliases["srv"]["args"])
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_alias_resolves_on_connect(self, mock_run, _gp, _res):
+    def test_alias_resolves_on_connect(self, mock_run, _gp, _res, _hk):
         """sf myalias should expand to the stored target and connect."""
         _save_aliases({"myalias": {"target": "admin@1.2.3.4", "args": ["-p", "2222"]}})
         # Pre-store credential so no prompt needed
@@ -704,10 +796,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.assertIn("2222", cmd)
         self.assertIn("admin@1.2.3.4", cmd)
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_alias_with_jump_host(self, mock_run, _gp, _res):
+    def test_alias_with_jump_host(self, mock_run, _gp, _res, _hk):
         """Alias with jump host args should expand correctly."""
         _save_aliases({
             "prod": {
@@ -726,10 +819,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.assertIn("jump@gw", cmd)
         self.assertIn("admin@10.0.0.5", cmd)
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_name_stripped_from_ssh_command(self, mock_run, _gp, _res):
+    def test_name_stripped_from_ssh_command(self, mock_run, _gp, _res, _hk):
         """--name and its value should not appear in the SSH command."""
         with mock.patch("sys.argv", ["sf", "admin@host", "--name", "foo"]):
             with self.assertRaises(SystemExit):
@@ -738,10 +832,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         self.assertNotIn("--name", cmd)
         self.assertNotIn("foo", cmd)
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=255)
-    def test_name_saved_even_on_failure(self, mock_run, _gp, _res):
+    def test_name_saved_even_on_failure(self, mock_run, _gp, _res, _hk):
         """Alias should be saved even if SSH connection fails."""
         with mock.patch("sys.argv", ["sf", "admin@host", "--name", "fail_alias"]):
             with self.assertRaises(SystemExit):
@@ -749,10 +844,11 @@ class TestAliasInSfMain(_SfMainTestBase):
         aliases = _load_aliases()
         self.assertIn("fail_alias", aliases)
 
+    @mock.patch("sesame.cli._ssh_has_keys", return_value=False)
     @mock.patch("sesame.cli._resolve_ssh_user", return_value="me")
     @mock.patch("sesame.cli.getpass.getpass", return_value="pw")
     @mock.patch("sesame.cli.run_command", return_value=0)
-    def test_subcommand_not_treated_as_alias(self, mock_run, _gp, _res):
+    def test_subcommand_not_treated_as_alias(self, mock_run, _gp, _res, _hk):
         """Known subcommands (cp, ftp, sync) should not be resolved as aliases."""
         _save_aliases({"cp": {"target": "admin@host", "args": []}})
         with mock.patch("sys.argv", ["sf", "cp", "local.txt", "admin@host:/tmp/"]):

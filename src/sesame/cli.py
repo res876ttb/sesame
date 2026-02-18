@@ -633,6 +633,53 @@ def _resolve_ssh_user(host: str) -> str:
     return getpass.getuser()
 
 
+def _ssh_has_keys(host: str, cleaned_args: List[str]) -> bool:
+    """Check if SSH key authentication is likely available for a host.
+
+    When identity keys exist (via ``-i`` flag, ssh-agent, or identity files
+    listed by ``ssh -G``), SSH should be allowed to try key auth before we
+    prompt the user for a password.
+    """
+    # 1. Explicit -i identity file on the command line
+    for idx, a in enumerate(cleaned_args):
+        if a == "-i" and idx + 1 < len(cleaned_args):
+            if Path(cleaned_args[idx + 1]).expanduser().is_file():
+                return True
+        elif a.startswith("-i") and len(a) > 2:
+            if Path(a[2:]).expanduser().is_file():
+                return True
+
+    # 2. ssh-agent has keys loaded
+    if os.environ.get("SSH_AUTH_SOCK"):
+        try:
+            result = subprocess.run(
+                ["ssh-add", "-l"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+    # 3. Identity files configured in SSH config (includes defaults)
+    bare_host = host.split("@", 1)[1] if "@" in host else host
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", bare_host],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.lower().startswith("identityfile "):
+                    key_path = Path(line.split(None, 1)[1]).expanduser()
+                    if key_path.is_file():
+                        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return False
+
+
 def _extract_target_hosts(cleaned_args: List[str], mode: str) -> List[str]:
     """Identify user@host targets from cleaned args that may need credentials.
 
@@ -832,6 +879,8 @@ def ssm_main() -> None:
 
     for host_key in target_hosts:
         if host_key not in all_creds:
+            if _ssh_has_keys(host_key, result.cleaned_args):
+                continue
             try:
                 password = getpass.getpass(f"{host_key}'s password: ")
             except (EOFError, KeyboardInterrupt):
